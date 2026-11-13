@@ -1,6 +1,6 @@
 {
   "name": "@bloomscorp/bloomsight-node",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Send Bloomsight email templates from your Node.js backend, safely: idempotent, retried, typed.",
   "type": "commonjs",
   "main": "./dist/index.js",

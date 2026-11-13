@@ -1,5 +1,6 @@
 import {randomUUID} from 'node:crypto';
 
+import {prepareAttachments, type PreparedAttachment} from './attachments';
 import {BloomsightError} from './error';
 import type {
 	Batch, BloomsightOptions, MailboxLimits, Send, SendBatchInput, SendMailInput, Unsubscribe,
@@ -15,6 +16,8 @@ import {VERSION} from './version';
  * - Network errors, 429 and 5xx are retried with backoff, honouring Retry-After.
  * - Failures throw `BloomsightError` with a `code`; the key never appears in one.
  * - It refuses to run in a browser, where the key would be exposed.
+ * - Attachments are checked against the server's rules before anything is uploaded,
+ *   and sent as multipart/form-data with a longer per-attempt timeout (§8.1).
  */
 
 const DEFAULT_BASE = 'https://z.bloomscorp.com';
@@ -25,6 +28,10 @@ interface RequestOptions {
 	method: 'GET' | 'POST' | 'DELETE';
 	path: string;
 	body?: unknown;
+	/** Sent as multipart/form-data instead of `body`, rebuilt for every attempt from the same bytes. */
+	multipart?: {fields: Array<[string, string]>; files: PreparedAttachment[]};
+	/** Per attempt; the client's `timeoutMs` when not given. */
+	timeoutMs?: number;
 	idempotencyKey?: string;
 	query?: Record<string, string | number | undefined>;
 }
@@ -37,6 +44,7 @@ export class Bloomsight {
 	readonly #apiKey: string;
 	readonly #base: string;
 	readonly #timeoutMs: number;
+	readonly #attachmentTimeoutMs: number;
 	readonly #maxRetries: number;
 	readonly #maxRetryWaitMs: number;
 	readonly #fetch: typeof fetch;
@@ -59,6 +67,7 @@ export class Bloomsight {
 		this.#apiKey = key;
 		this.#base = String(options.baseUrl ?? DEFAULT_BASE).replace(/\/+$/, '');
 		this.#timeoutMs = options.timeoutMs ?? 15000;
+		this.#attachmentTimeoutMs = options.attachmentTimeoutMs ?? 120000;
 		this.#maxRetries = Math.max(0, options.maxRetries ?? 3);
 		this.#maxRetryWaitMs = options.maxRetryWaitMs ?? 60000;
 		this.#fetch = f;
@@ -74,12 +83,26 @@ export class Bloomsight {
 	/**
 	 * Queue one email. It goes out within about a second when the mailbox has
 	 * budget; follow it with `getSend(id)`.
+	 *
+	 * With `attachments`, it is not queued: blooms.ai sends it while this call waits
+	 * (up to `attachmentTimeoutMs` per attempt) and answers `sent`, `failed` or
+	 * `unknown` (or `sending`, when a retry met the first attempt still sending).
 	 */
 	async sendMail(input: SendMailInput): Promise<Send> {
-		const {idempotencyKey, ...body} = input;
-		const {data, headers} = await this.#request<Send>({
-			method: 'POST', path: '/send', body, idempotencyKey: idempotencyKey ?? randomUUID(),
-		});
+		const {idempotencyKey, attachments, ...body} = input;
+		const key = idempotencyKey ?? randomUUID();
+		let req: RequestOptions;
+		if (attachments === undefined || attachments === null || (Array.isArray(attachments) && attachments.length === 0)) {
+			req = {method: 'POST', path: '/send', body, idempotencyKey: key};
+		} else {
+			// Checked and read once, before anything is uploaded.
+			const files = await prepareAttachments(attachments);
+			const fields: Array<[string, string]> = [['templateId', String(body.templateId)], ['engineId', String(body.engineId)]];
+			if (body.data !== undefined) fields.push(['data', JSON.stringify(body.data)]);
+			if (body.priority !== undefined) fields.push(['priority', String(body.priority)]);
+			req = {method: 'POST', path: '/send', multipart: {fields, files}, timeoutMs: this.#attachmentTimeoutMs, idempotencyKey: key};
+		}
+		const {data, headers} = await this.#request<Send>(req);
 		return {...data, replayed: headers.get('idempotent-replayed') === 'true'};
 	}
 
@@ -158,9 +181,11 @@ export class Bloomsight {
 			Accept: 'application/json',
 			'User-Agent': `bloomsight-node/${VERSION}`,
 		};
-		if (req.body !== undefined) headers['Content-Type'] = 'application/json';
+		// A multipart body sets its own Content-Type, with the boundary.
+		if (req.body !== undefined && !req.multipart) headers['Content-Type'] = 'application/json';
 		if (req.idempotencyKey) headers['Idempotency-Key'] = req.idempotencyKey;
-		const body = req.body === undefined ? undefined : JSON.stringify(req.body);
+		const json = req.body === undefined ? undefined : JSON.stringify(req.body);
+		const timeoutMs = req.timeoutMs ?? this.#timeoutMs;
 		// GETs are safe to repeat; POSTs only with an idempotency key, which every
 		// send has; the batch controls (pause/resume/cancel) and list edits are
 		// idempotent by nature.
@@ -170,7 +195,8 @@ export class Bloomsight {
 		for (;;) {
 			let response: Response;
 			try {
-				response = await this.#fetch(url, {method: req.method, headers, body, signal: AbortSignal.timeout(this.#timeoutMs)});
+				const body = req.multipart ? buildForm(req.multipart) : json;
+				response = await this.#fetch(url, {method: req.method, headers, body, signal: AbortSignal.timeout(timeoutMs)});
 			} catch (cause) {
 				const timedOut = (cause as Error)?.name === 'TimeoutError' || (cause as Error)?.name === 'AbortError';
 				if (retryable && attempt < this.#maxRetries) {
@@ -217,4 +243,12 @@ export class Bloomsight {
 		const base = Math.min(10000, 500 * 2 ** attempt);
 		return Math.round(base * (1 + Math.random() * 0.25));
 	}
+}
+
+/** A fresh multipart body for one attempt; every attempt carries the same fields and bytes. */
+function buildForm({fields, files}: NonNullable<RequestOptions['multipart']>): FormData {
+	const form = new FormData();
+	for (const [name, value] of fields) form.append(name, value);
+	for (const file of files) form.append('attachments', new Blob([file.bytes], {type: file.contentType}), file.filename);
+	return form;
 }

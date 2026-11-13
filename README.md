@@ -59,6 +59,59 @@ confirmation is worse than a missing one.
 within 24 hours returns the original send (`replayed: true`); the same key with a
 different body throws `IDEMPOTENCY_CONFLICT`.
 
+## Attachments
+
+```ts
+import {readFile} from 'node:fs/promises';
+
+const send = await bloomsight.sendMail({
+	templateId, engineId,
+	data: {name: 'Asha', email: 'asha@example.com', orderId: 'A-1042'},
+	idempotencyKey: 'order-A-1042-invoice',
+	attachments: [
+		{filename: 'invoice-A-1042.pdf', content: await renderInvoicePdf(order)},   // a Buffer
+		{filename: 'terms.pdf', path: '/srv/app/assets/terms.pdf'},                 // read when sent
+		{filename: 'items.csv', content: 'item,qty\nSaree,2\n', contentType: 'text/csv'},
+	],
+});
+// { id, status: 'sent', attachmentCount: 3, missingVariables: [] }
+```
+
+Each attachment has a `filename` and exactly one of `content` (a `Buffer`, `Uint8Array`,
+`ArrayBuffer`, `Blob`, or a string sent as UTF-8 text) or `path` (a file on your server,
+read at send time). `contentType` is optional: it is guessed from the extension (`pdf`,
+`png`, `jpg`, `csv`, `docx`, `xlsx`, `ics`, …), otherwise `application/octet-stream`.
+
+**A send with attachments is not queued.** Files are never stored by Bloomsight, so
+blooms.ai sends the email while your call waits, up to `attachmentTimeoutMs` (2 minutes)
+per attempt, and answers with how it went. These come back as the send, not as an error:
+
+| `status` | Means |
+|---|---|
+| `sent` | The mail provider accepted it |
+| `failed` | The provider refused it outright (for example a bad address); `errorCode` says why |
+| `unknown` | The connection to the provider dropped mid-send: it may or may not have arrived. Never retried for you |
+| `sending` | A retry met the first attempt still sending; follow it with `getSend(id)` |
+
+When the mailbox has no budget left, or blooms.ai is busy, nothing is sent and the call is
+retried for you with the same idempotency key (`429` / `503` with `Retry-After`), as for any
+send; a wait longer than `maxRetryWaitMs` is thrown with `retryAfter`.
+
+The files go on the **primary message only**, never on its auto-reply. A `blm_test_…` key
+checks the files against every rule below too, and sends nothing (`status: 'test'`).
+
+**Limits**, checked by the library before anything is uploaded (and again by blooms.ai):
+
+| Rule | Code |
+|---|---|
+| 1 to 5 files | `TOO_MANY_ATTACHMENTS` |
+| Each file at most 5 MB | `ATTACHMENT_TOO_LARGE` |
+| All files together at most 15 MB | `ATTACHMENTS_TOO_LARGE` |
+| No empty file; a `filename` of 1 to 150 characters after any folder part, control characters and `"` are removed; exactly one of `content` / `path`; a readable `path` | `INVALID_ATTACHMENT` |
+| Not a type mail providers refuse: `.exe`, `.js`, `.bat`, `.msi`, `.jar`, `.scr`, `.vbs`, `.iso`, … (the last extension counts, so `invoice.pdf.exe` is refused) | `ATTACHMENT_TYPE_BLOCKED` |
+
+Batches take no attachments.
+
 ## Send to a list
 
 ```ts
@@ -117,6 +170,7 @@ try {
 | `INVALID_VARIABLES` | A value name or size is not allowed (100 values, 5,000 characters each, 16 KB in all) |
 | `IDEMPOTENCY_CONFLICT` | The key was used with a different request |
 | `INVALID_ROWS`, `BULK_NOT_IN_PLAN`, `MONTHLY_LIMIT` | Batches |
+| `TOO_MANY_ATTACHMENTS`, `ATTACHMENT_TOO_LARGE`, `ATTACHMENTS_TOO_LARGE`, `INVALID_ATTACHMENT`, `ATTACHMENT_TYPE_BLOCKED` | [Attachments](#attachments) |
 | `RATE_LIMITED` | Too many requests; retried for you, thrown when retries run out |
 | `NETWORK_FAILURE`, `TIMEOUT`, `BAD_RESPONSE` | blooms.ai could not be reached or answered oddly, after retries |
 
@@ -127,6 +181,7 @@ new Bloomsight({
 	apiKey,                      // required
 	baseUrl: 'https://z.bloomscorp.com',
 	timeoutMs: 15000,            // per attempt
+	attachmentTimeoutMs: 120000, // per attempt, for a send with attachments (sent while you wait)
 	maxRetries: 3,
 	maxRetryWaitMs: 60000,       // a longer Retry-After is thrown, not waited out
 });

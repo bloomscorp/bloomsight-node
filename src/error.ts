@@ -5,8 +5,16 @@
  *   INVALID_API_KEY       the key is missing or not a Bloomsight key
  *   BROWSER_NOT_ALLOWED   constructed in a browser, where the key would leak
  *   NETWORK_FAILURE       blooms.ai could not be reached, after the retries
- *   TIMEOUT               an attempt took longer than `timeoutMs`, after the retries
+ *   TIMEOUT               an attempt took longer than `timeoutMs` (`attachmentTimeoutMs` for a
+ *                         send with attachments), after the retries
  *   BAD_RESPONSE          blooms.ai answered with something that is not its JSON
+ * Attachment rules, checked before anything is uploaded (the server uses the same codes):
+ *   TOO_MANY_ATTACHMENTS     more than 5 files
+ *   ATTACHMENT_TOO_LARGE     a file over 5 MB
+ *   ATTACHMENTS_TOO_LARGE    all files together over 15 MB
+ *   INVALID_ATTACHMENT       an empty file, a bad filename, not exactly one of content/path,
+ *                            an unreadable path or an invalid contentType
+ *   ATTACHMENT_TYPE_BLOCKED  a type mail providers refuse (.exe, .js, .bat, …)
  */
 export class BloomsightError extends Error {
 	readonly code: string;

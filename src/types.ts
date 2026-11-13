@@ -14,6 +14,11 @@ export interface BloomsightOptions {
 	baseUrl?: string;
 	/** Per attempt. Default 15 seconds. */
 	timeoutMs?: number;
+	/**
+	 * Per attempt, for a `sendMail` that carries attachments: the server sends it while
+	 * the request waits, so it takes longer than a queued send. Default 120 seconds.
+	 */
+	attachmentTimeoutMs?: number;
 	/** Retries after the first attempt, for network errors, 429 and 5xx. Default 3. */
 	maxRetries?: number;
 	/** The longest `Retry-After` the library will wait out by itself. Default 60 seconds. */
@@ -22,10 +27,33 @@ export interface BloomsightOptions {
 	fetch?: typeof fetch;
 }
 
+/**
+ * A file to attach to the email (backend-sending.md §8.1). Give exactly one of
+ * `content` or `path`.
+ */
+export interface Attachment {
+	/** The name the recipient sees. A folder part, control characters and double quotes are removed; 1 to 150 characters remain. */
+	filename: string;
+	/** The bytes. A string is sent as UTF-8 text. */
+	content?: Buffer | Uint8Array | ArrayBuffer | Blob | string;
+	/** A file on this server's disk, read when the email is sent. */
+	path?: string;
+	/** Guessed from the filename's extension when not given; `application/octet-stream` otherwise. */
+	contentType?: string;
+}
+
 export interface SendMailInput {
 	templateId: string;
 	engineId: string;
 	data?: TemplateData;
+	/** Only `transactional` (the default). Bulk mail is sent as a batch. */
+	priority?: 'transactional';
+	/**
+	 * Up to 5 files, each at most 5 MB and 15 MB together, on the primary message only.
+	 * A send with attachments is not queued: blooms.ai sends it while the call waits and
+	 * answers `sent`, `failed` or `unknown` (backend-sending.md §8.1).
+	 */
+	attachments?: Attachment[];
 	/**
 	 * Makes the send safe to repeat: the same key and body returns the original send
 	 * for 24 hours. One is generated when you don't pass one; pass your own (for
@@ -51,6 +79,8 @@ export interface Send {
 	finishedAt?: string | null;
 	/** True when sent with a `blm_test_…` key: checked, nothing sent. */
 	test?: boolean;
+	/** How many files the send carried (sends with attachments). */
+	attachmentCount?: number;
 	/** Template values the template uses that this send did not supply. */
 	missingVariables?: string[];
 	/** True when an Idempotency-Key matched an earlier send and nothing new was queued. */
